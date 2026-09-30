@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MEGHDOOT — Hyper-local rainfall nowcasting for eastern India</title>
+<meta name="description" content="A satellite-only 0–3 hour severe-rainfall nowcasting and hyper-local warning system for eastern India, benchmarked against ISRO's operational product. Smart India Hackathon 2026, problem statement SIH26077.">
+<meta property="og:title" content="MEGHDOOT — hyper-local rainfall nowcasting">
+<meta property="og:description" content="Satellite-only 0–3 hour rainfall nowcasting at 4 km for eastern India. SIH 2026, SIH26077.">
+<meta property="og:type" content="website">
+<style>
+  :root{
+    --navy:#113a63;
+    --blue:#1f6fb5;
+    --teal:#145a3e;
+    --ochre:#8a4f0c;
+    --brick:#8e221c;
+    --plum:#5b2d63;
+    --ink:#141414;
+    --grey:#4a5560;
+    --line:#d8e0e8;
+    --paper:#f4f6f8;
+    --bg:#ffffff;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --navy:#8fbce8; --blue:#6aa9de; --teal:#6fc49b; --ochre:#d9a45c;
+      --brick:#e08a83; --plum:#c39bcc; --ink:#e9edf1; --grey:#9fadba;
+      --line:#2a3644; --paper:#161d26; --bg:#0e141b;
+    }
+  }
+  :root[data-theme="dark"]{
+    --navy:#8fbce8; --blue:#6aa9de; --teal:#6fc49b; --ochre:#d9a45c;
+    --brick:#e08a83; --plum:#c39bcc; --ink:#e9edf1; --grey:#9fadba;
+    --line:#2a3644; --paper:#161d26; --bg:#0e141b;
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,
+                "Times New Roman",serif;
+    line-height:1.55; font-size:17px;
+  }
+  .wrap{max-width:860px; margin:0 auto; padding:0 16px}
+
+  header{border-bottom:1px solid var(--line); padding:44px 0 30px}
+  .eyebrow{
+    font-size:12px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--grey); font-weight:700; margin:0 0 12px
+  }
+  h1{
+    font-size:clamp(34px,7vw,52px); line-height:1.05; margin:0 0 12px;
+    letter-spacing:-.015em; color:var(--navy);
+  }
+  .tagline{font-size:clamp(17px,2.6vw,21px); color:var(--ink); margin:0 0 6px}
+  .sub{color:var(--grey); font-size:15px; margin:0}
+
+  .status{
+    display:inline-flex; align-items:center; gap:8px; margin-top:22px;
+    border:1px solid var(--line); background:var(--paper);
+    border-radius:999px; padding:7px 15px; font-size:13.5px; color:var(--grey);
+  }
+  .dot{
+    width:8px; height:8px; border-radius:50%; background:var(--ochre);
+    flex:none;
+  }
+
+  section{padding:34px 0; border-bottom:1px solid var(--line)}
+  h2{
+    font-size:12px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--grey); margin:0 0 18px; font-weight:700;
+  }
+  p{margin:0 0 15px}
+  .lead{font-size:18px}
+
+  .grid{display:grid; gap:14px; grid-template-columns:repeat(4,1fr)}
+  @media (max-width:720px){.grid{grid-template-columns:repeat(2,1fr)}}
+  .cell{
+    border:1px solid var(--line); border-radius:10px; padding:14px 13px;
+    background:var(--paper);
+  }
+  .cell .n{
+    font-size:23px; font-weight:700; color:var(--navy); display:block;
+    line-height:1.15;
+  }
+  .cell .k{font-size:13px; color:var(--grey); display:block; margin-top:4px}
+
+  ul{margin:0; padding-left:20px}
+  li{margin-bottom:9px}
+  li b{color:var(--navy)}
+
+  .links{display:flex; flex-wrap:wrap; gap:10px; margin-top:4px}
+  .btn{
+    display:inline-block; border:1px solid var(--navy); color:var(--navy);
+    border-radius:8px; padding:10px 16px; text-decoration:none;
+    font-size:15px; font-weight:700; background:transparent;
+  }
+  .btn:hover{background:var(--navy); color:var(--bg)}
+  .btn.sec{border-color:var(--line); color:var(--grey); font-weight:400}
+  .btn.sec:hover{background:var(--paper); color:var(--ink)}
+
+  .note{
+    border-left:3px solid var(--ochre); padding:2px 0 2px 14px;
+    color:var(--grey); font-size:15px; margin:18px 0 0;
+  }
+
+  footer{padding:26px 0 46px; color:var(--grey); font-size:13.5px}
+  footer a{color:var(--grey)}
+  a{color:var(--blue)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <p class="eyebrow">Smart India Hackathon 2026 &middot; SIH26077 &middot; Team AgriFlumes</p>
+    <h1>MEGHDOOT</h1>
+    <p class="tagline">Hyper-local severe-rainfall early warning for eastern India,
+       0&ndash;3 hours ahead, at 4&nbsp;km, from satellite alone.</p>
+    <p class="sub">Ministry of Earth Sciences &middot; Disaster Management</p>
+    <div class="status"><span class="dot"></span>
+      Public shell. The live map and forecast layers arrive with the product stage.</div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>The problem</h2>
+    <p class="lead">Most of eastern India has no weather radar. Warnings are issued
+       for whole districts, hours late, while the flooding happens street by street.</p>
+    <p>Rain is the disaster mechanism here: waterlogging, drainage failure and
+       transport shutdown. A warning that names a district and a day cannot be
+       acted on. One that names a 4&nbsp;km cell and a time can.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>The approach</h2>
+    <p>India already has the observation it needs. INSAT-3DR sees every village
+       every 30 minutes at 4&nbsp;km. We forecast the next three hours from that
+       image stream, then turn the forecast into a calibrated warning.</p>
+    <div class="grid">
+      <div class="cell"><span class="n">4 km</span><span class="k">cell size, not districts</span></div>
+      <div class="cell"><span class="n">0&ndash;3 h</span><span class="k">forecast horizon</span></div>
+      <div class="cell"><span class="n">30 min</span><span class="k">refresh, day and night</span></div>
+      <div class="cell"><span class="n">&#8377;0</span><span class="k">external data cost</span></div>
+    </div>
+    <p class="note">The model is a U-Net with a residual head and one output head
+       per lead time, pretrained on twenty years of GPM IMERG and fine-tuned on
+       INSAT-3DR. It is scored every cycle against persistence, climatology,
+       optical flow and ISRO&rsquo;s own operational nowcast.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What we are careful about</h2>
+    <ul>
+      <li><b>Warning versus guidance.</b> 0&ndash;60 minutes is a warning.
+          60&ndash;180 minutes is a probability at 20&nbsp;km scale, and is
+          labelled that way.</li>
+      <li><b>The ceiling is published.</b> At the highest rain rates every
+          method in the literature scores close to zero. We report that rather
+          than forecast through it.</li>
+      <li><b>Named exclusions.</b> This forecasts rainfall. Lightning, hail and
+          wind gusts each need an instrument we cannot obtain, so we do not
+          claim them.</li>
+      <li><b>Impact, not flood prediction.</b> The impact layer ranks locations
+          by exposure. It is not a hydraulic model.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Project resources</h2>
+    <div class="links">
+      <a class="btn" href="https://github.com/explolar/Meghdoot">Code on GitHub</a>
+      <a class="btn sec" href="https://drive.google.com/drive/folders/14NMQW6pkKW-vyi8EL7GgeXsSjCLYdyDu?usp=drive_link">Research library</a>
+    </div>
+    <p class="note">The research library holds the 72 papers this design is built
+       on, the numbered evidence log, and the full plan. Every figure quoted
+       above traces back to a table or figure in one of them.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    Team AgriFlumes &middot; Problem statement SIH26077 &middot;
+    Data: <a href="https://mosdac.gov.in">ISRO MOSDAC</a> and
+    <a href="https://gpm.nasa.gov/data/imerg">NASA GPM IMERG</a>.
+    Not an operational warning service.
+  </div>
+</footer>
+
+</body>
+</html>
