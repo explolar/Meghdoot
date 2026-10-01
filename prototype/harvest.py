@@ -46,10 +46,11 @@ CONFIG = os.path.join(NIRA, "config.yaml")
 ARCHIVE = r"E:\sih\data\archive"
 SCRATCH = r"E:\sih\data\_scratch"
 
-# Concurrent MOSDAC transfers. A single transfer does not saturate the link;
-# three measured roughly three times the sequential rate. Beyond that the
-# gateway starts dropping large transfers, so the gain reverses.
-WORKERS = int(os.environ.get("MEGHDOOT_WORKERS", "3"))
+# Concurrent MOSDAC transfers. A single transfer does not saturate the link,
+# so concurrency helps, but the gateway drops large transfers under load: at
+# three workers most granules needed a second or third attempt, and the retries
+# ate the gain. Two is the setting that measured fastest end to end.
+WORKERS = int(os.environ.get("MEGHDOOT_WORKERS", "2"))
 
 MONTHS = dict(JAN=1, FEB=2, MAR=3, APR=4, MAY=5, JUN=6,
               JUL=7, AUG=8, SEP=9, OCT=10, NOV=11, DEC=12)
@@ -86,28 +87,69 @@ def save_day(day, store):
     os.replace(tmp, day_path(day))
 
 
-def search_window(dataset_id, bbox, start, end, attempts=6):
-    """One search call, tolerating the gateway's intermittent failures.
+def search_window(dataset_id, bbox, start, end, attempts=4, widen=True):
+    """Search for granules, working around a server-side query bug.
 
-    MOSDAC's API returns 500 sporadically under no particular load. Giving up
-    after a couple of tries silently drops a whole day from the archive, and
-    across a two-month harvest that is a scatter of missing days that only
-    shows up later as broken training windows. The backoff is therefore both
-    longer and more patient than the per-request retry inside mosdac_io.
+    MOSDAC returns 500 for some single-day windows no matter how often they
+    are retried - 2026-08-01 fails every time with or without a bounding box,
+    while a three-day window containing it succeeds immediately. So this is a
+    query-shape bug on their side, not load, and retrying harder does not help.
+
+    The fix is to widen the window and filter the results locally. The caller
+    already discards granules outside the day it asked for, so a wider search
+    costs one request and nothing else.
     """
-    for i in range(attempts):
-        try:
-            return M.search(dataset_id,
-                            start=start.strftime("%Y-%m-%d"),
-                            end=end.strftime("%Y-%m-%d"),
-                            bbox=bbox, count="100", timeout=45)
-        except Exception as e:                              # noqa: BLE001
-            if i == attempts - 1:
-                print("    search FAILED after %d attempts: %s"
-                      % (attempts, str(e)[:80]))
-                return {}
-            time.sleep(min(3.0 * (2 ** i), 45.0))
+    # Try the single-day window first: it returns the most granules for the
+    # day we actually want. Some dates 500 no matter how often they are
+    # retried, and for those a wider window is the only thing that works, at
+    # the cost of the server's 100-result cap truncating the tail.
+    windows = [(start, end)]
+    if widen:
+        windows.append((start, end + dt.timedelta(days=1)))
+        windows.append((start - dt.timedelta(days=1),
+                        end + dt.timedelta(days=1)))
+
+    for w_start, w_end in windows:
+        for i in range(attempts):
+            try:
+                return _search_paged(dataset_id, w_start, w_end, bbox)
+            except Exception:                               # noqa: BLE001
+                if i < attempts - 1:
+                    time.sleep(min(2.0 * (2 ** i), 20.0))
+        print("    search failed on %s..%s, widening"
+              % (w_start.strftime("%m-%d"), w_end.strftime("%m-%d")))
+    print("    search FAILED for %s even with a widened window"
+          % start.strftime("%Y-%m-%d"))
     return {}
+
+
+def _search_paged(dataset_id, w_start, w_end, bbox, page=100, max_pages=12):
+    """Follow startIndex until every result is retrieved.
+
+    The API caps a response at 100 entries but reports the true count in
+    totalResults. A busy two-day window has ~120, so a single unpaged request
+    silently drops twenty granules - and because the ordering puts the newest
+    first, what goes missing is the tail of the earliest day. That is invisible
+    in the output and shows up much later as gaps in the training windows.
+    """
+    entries, total, idx = [], None, 1
+    for _ in range(max_pages):
+        res = M.search(dataset_id,
+                       start=w_start.strftime("%Y-%m-%d"),
+                       end=w_end.strftime("%Y-%m-%d"),
+                       bbox=bbox, count=str(page), start_index=idx,
+                       timeout=45)
+        got = res.get("entries") or []
+        entries.extend(got)
+        if total is None:
+            try:
+                total = int(res.get("totalResults") or 0)
+            except (TypeError, ValueError):
+                total = 0
+        if len(got) < page or len(entries) >= total:
+            break
+        idx += page
+    return {"entries": entries, "totalResults": total}
 
 
 def harvest(start_day, end_day, cfg, keep_granules=False, channel="TIR1"):
