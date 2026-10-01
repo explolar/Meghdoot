@@ -28,6 +28,7 @@ Authorized Apps, or every download returns 401.
 import datetime as dt
 import os
 import re
+import time
 
 import numpy as np
 import requests
@@ -97,8 +98,17 @@ def granule_url(when):
     return "%s/%d/%03d/%s" % (BASE, when.year, doy, granule_name(when))
 
 
-def download(when, cache=CACHE, session=None, timeout=180):
-    """Fetch one half-hourly granule, returning the local path."""
+def download(when, cache=CACHE, session=None, timeout=180, attempts=4):
+    """Fetch one half-hourly granule, returning the local path.
+
+    GES DISC returns 503 sporadically under concurrent load. Without a retry a
+    single blip loses that half-hour permanently, and because the model needs
+    *consecutive* frames, one missing slot destroys every training window that
+    would have spanned it. A short backoff recovers almost all of them.
+
+    404 is different and is not retried: it means the granule is not published
+    yet, which is a fact about the archive rather than a transient failure.
+    """
     os.makedirs(cache, exist_ok=True)
     name = granule_name(when)
     out = os.path.join(cache, name)
@@ -106,23 +116,38 @@ def download(when, cache=CACHE, session=None, timeout=180):
         return out
     s = session or _session()
     url = granule_url(when)
-    tmp = out + ".part"
-    r = s.get(url, timeout=timeout, stream=True)
-    if r.status_code == 404:
-        raise FileNotFoundError("IMERG granule not published: %s" % name)
-    r.raise_for_status()
-    with open(tmp, "wb") as f:
-        for chunk in r.iter_content(1 << 20):
-            if chunk:
-                f.write(chunk)
-    with open(tmp, "rb") as f:
-        if f.read(4) != b"\x89HDF":
-            os.remove(tmp)
-            raise ValueError(
-                "not HDF5 - check that 'NASA GESDISC DATA ARCHIVE' is approved "
-                "under Earthdata Authorized Apps")
-    os.replace(tmp, out)
-    return out
+    last = None
+
+    for i in range(attempts):
+        tmp = "%s.part%d" % (out, i)
+        try:
+            r = s.get(url, timeout=timeout, stream=True)
+            if r.status_code == 404:
+                raise FileNotFoundError("IMERG granule not published: %s" % name)
+            r.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    if chunk:
+                        f.write(chunk)
+            with open(tmp, "rb") as f:
+                if f.read(4) != b"\x89HDF":
+                    raise ValueError(
+                        "not HDF5 - check that 'NASA GESDISC DATA ARCHIVE' is "
+                        "approved under Earthdata Authorized Apps")
+            os.replace(tmp, out)
+            return out
+        except FileNotFoundError:
+            raise
+        except Exception as e:                             # noqa: BLE001
+            last = e
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            if i < attempts - 1:
+                time.sleep(min(2.0 * (2 ** i), 20.0))
+    raise last
 
 
 def read_box(path, lat_c=LAT_C, lon_c=LON_C, box_km=BOX_KM):
