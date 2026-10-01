@@ -15,9 +15,11 @@ Usage:
     python harvest_imerg.py --days 3
 """
 import argparse
+import concurrent.futures as cf
 import datetime as dt
 import os
 import sys
+import threading
 
 import numpy as np
 
@@ -25,6 +27,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import imerg                                               # noqa: E402
 
 ARCHIVE = r"E:\sih\data\archive"
+
+# IMERG granules are ~8 MB, an order of magnitude smaller than INSAT's, so a
+# wider pool is comfortable here.
+WORKERS = int(os.environ.get("MEGHDOOT_IMERG_WORKERS", "4"))
 
 
 def day_path(day):
@@ -57,31 +63,53 @@ def harvest(start_day, end_day, keep_granules=False):
         before = len(store)
         print("%s" % day.strftime("%Y-%m-%d"))
 
-        for slot in range(48):                      # 48 half-hours per day
-            t = day + dt.timedelta(minutes=30 * slot)
-            key = t.strftime("%H%M")
-            if key in store:
-                total_have += 1
-                continue
-            try:
-                path = imerg.download(t, session=session)
-                field, _ = imerg.read_box(path)
-                store[key] = imerg.upsample_to(field, (128, 128))
-                total_new += 1
-                if field.max() > 1.0:
-                    print("    %s  max %5.1f mm/h   %.2f%% >= 4"
-                          % (key, field.max(), 100 * (field >= 4).mean()))
-                if not keep_granules and os.path.exists(path):
-                    os.remove(path)
-                # checkpoint every few slots: a day takes ~15 min and an
-                # interrupted run should not lose it
-                if total_new % 8 == 0:
-                    save_day(day, store)
-            except FileNotFoundError:
-                pass                                 # not published yet
-            except Exception as exc:                 # noqa: BLE001
-                total_fail += 1
-                print("    %s  FAILED %s" % (key, str(exc)[:70]))
+        slots = [day + dt.timedelta(minutes=30 * s) for s in range(48)]
+        slots = [t for t in slots if t.strftime("%H%M") not in store]
+        total_have += 48 - len(slots)
+
+        # Download in parallel, crop serially. Each worker gets its own
+        # session: the Earthdata cookie is what makes a request fast, and a
+        # session is not thread-safe to share.
+        for i in range(0, len(slots), WORKERS):
+            batch = slots[i:i + WORKERS]
+
+            def _fetch(t_, _sessions={}):
+                tid = threading.get_ident()
+                if tid not in _sessions:
+                    _sessions[tid] = imerg.warm_up(imerg._session())
+                try:
+                    return t_, imerg.download(t_, session=_sessions[tid]), None
+                except Exception as exc:              # noqa: BLE001
+                    return t_, None, exc
+
+            with cf.ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                for t_, path, err in pool.map(_fetch, batch):
+                    key = t_.strftime("%H%M")
+                    if err is not None:
+                        if not isinstance(err, FileNotFoundError):
+                            total_fail += 1
+                            print("    %s  FAILED %s" % (key, str(err)[:70]))
+                        continue
+                    try:
+                        field, _ = imerg.read_box(path)
+                        store[key] = imerg.upsample_to(field, (128, 128))
+                        total_new += 1
+                        if field.max() > 1.0:
+                            print("    %s  max %5.1f mm/h   %.2f%% >= 4"
+                                  % (key, field.max(),
+                                     100 * (field >= 4).mean()))
+                    except Exception as exc:          # noqa: BLE001
+                        total_fail += 1
+                        print("    %s  CROP FAILED %s" % (key, str(exc)[:60]))
+                    finally:
+                        if not keep_granules and os.path.exists(path):
+                            try:
+                                os.remove(path)
+                            except OSError:
+                                pass
+
+            if len(store) > before:
+                save_day(day, store)
 
         if len(store) > before:
             save_day(day, store)

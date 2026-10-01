@@ -22,6 +22,7 @@ Usage:
     python harvest.py --days 30 --keep-granules      # debugging only
 """
 import argparse
+import concurrent.futures as cf
 import datetime as dt
 import os
 import re
@@ -44,6 +45,11 @@ from insat import read_tb, tb_to_rain, BOX                 # noqa: E402
 CONFIG = os.path.join(NIRA, "config.yaml")
 ARCHIVE = r"E:\sih\data\archive"
 SCRATCH = r"E:\sih\data\_scratch"
+
+# Concurrent MOSDAC transfers. A single transfer does not saturate the link;
+# three measured roughly three times the sequential rate. Beyond that the
+# gateway starts dropping large transfers, so the gain reverses.
+WORKERS = int(os.environ.get("MEGHDOOT_WORKERS", "3"))
 
 MONTHS = dict(JAN=1, FEB=2, MAR=3, APR=4, MAY=5, JUN=6,
               JUL=7, AUG=8, SEP=9, OCT=10, NOV=11, DEC=12)
@@ -80,8 +86,15 @@ def save_day(day, store):
     os.replace(tmp, day_path(day))
 
 
-def search_window(dataset_id, bbox, start, end, attempts=3):
-    """One search call, tolerating the gateway's intermittent failures."""
+def search_window(dataset_id, bbox, start, end, attempts=6):
+    """One search call, tolerating the gateway's intermittent failures.
+
+    MOSDAC's API returns 500 sporadically under no particular load. Giving up
+    after a couple of tries silently drops a whole day from the archive, and
+    across a two-month harvest that is a scatter of missing days that only
+    shows up later as broken training windows. The backoff is therefore both
+    longer and more patient than the per-request retry inside mosdac_io.
+    """
     for i in range(attempts):
         try:
             return M.search(dataset_id,
@@ -90,9 +103,10 @@ def search_window(dataset_id, bbox, start, end, attempts=3):
                             bbox=bbox, count="100", timeout=45)
         except Exception as e:                              # noqa: BLE001
             if i == attempts - 1:
-                print("    search failed: %s" % str(e)[:90])
+                print("    search FAILED after %d attempts: %s"
+                      % (attempts, str(e)[:80]))
                 return {}
-            time.sleep(2.0 * (i + 1))
+            time.sleep(min(3.0 * (2 ** i), 45.0))
     return {}
 
 
@@ -105,6 +119,7 @@ def harvest(start_day, end_day, cfg, keep_granules=False, channel="TIR1"):
         return 1
 
     total_new = total_have = total_fail = 0
+    missed_days = []
     day = start_day
     while day <= end_day:
         nxt = day + dt.timedelta(days=1)
@@ -120,37 +135,85 @@ def harvest(start_day, end_day, cfg, keep_granules=False, channel="TIR1"):
         print("%s  %3d granules listed, %d already stored"
               % (day.strftime("%Y-%m-%d"), len(dated), before))
 
-        for t, e in dated:
-            key = t.strftime("%H%M")
-            if key in store:
-                total_have += 1
-                continue
-            ident = e.get("identifier")
-            local = os.path.join(SCRATCH, ident)
-            try:
-                # token expires on long runs; refresh and retry once
+        if not dated:
+            # an empty day is either a genuine gap in the archive or a search
+            # that never succeeded; either way it must be visible, not silent
+            missed_days.append(day.strftime("%Y-%m-%d"))
+        todo = [(t, e) for t, e in dated if t.strftime("%H%M") not in store]
+        total_have += len(dated) - len(todo)
+
+        # Download in parallel, crop serially.
+        #
+        # A granule is ~100 MB and a single transfer does not saturate the
+        # link: measured sequentially this is about one granule every four
+        # minutes, which puts two months of data at eight days of wall clock.
+        # Several concurrent transfers run at close to the same per-file rate,
+        # so the throughput multiplies. The pool is kept small because MOSDAC
+        # drops large transfers under load, and the retry path is what makes
+        # the whole thing survive that.
+        for batch_start in range(0, len(todo), WORKERS):
+            batch = todo[batch_start:batch_start + WORKERS]
+            got = {}
+
+            def _fetch(item):
+                t_, e_ = item
+                ident_ = e_.get("identifier")
                 try:
-                    M.download(e.get("id"), ident, token, SCRATCH)
-                except Exception:                           # noqa: BLE001
+                    M.download(e_.get("id"), ident_, token, SCRATCH)
+                    return t_, ident_, None
+                except Exception as exc:                    # noqa: BLE001
+                    return t_, ident_, exc
+
+            with cf.ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                for t_, ident_, err in pool.map(_fetch, batch):
+                    got[t_] = (ident_, err)
+
+            # one token refresh per batch, then retry whatever failed
+            if any(err is not None for _, err in got.values()):
+                try:
                     token, _ = M.get_token(mc["username"], mc["password"],
                                            force=True)
-                    M.download(e.get("id"), ident, token, SCRATCH)
+                except Exception:                           # noqa: BLE001
+                    pass
+                for t_, (ident_, err) in list(got.items()):
+                    if err is None:
+                        continue
+                    try:
+                        M.download(dict(dated)[t_].get("id"), ident_, token,
+                                   SCRATCH)
+                        got[t_] = (ident_, None)
+                    except Exception as exc:                # noqa: BLE001
+                        got[t_] = (ident_, exc)
 
-                tb, _meta = read_tb(local, box=BOX, channel=channel)
-                store[key] = tb.astype(np.float32)
-                total_new += 1
-                print("    %s  Tb %.0f-%.0f K" % (key, tb.min(), tb.max()))
-            except Exception as exc:                        # noqa: BLE001
-                total_fail += 1
-                print("    %s  FAILED  %s" % (key, str(exc)[:70]))
-            finally:
+            for t_ in sorted(got):
+                ident_, err = got[t_]
+                key = t_.strftime("%H%M")
+                local = os.path.join(SCRATCH, ident_)
+                if err is not None:
+                    total_fail += 1
+                    print("    %s  FAILED  %s" % (key, str(err)[:70]))
+                else:
+                    try:
+                        tb, _meta = read_tb(local, box=BOX, channel=channel)
+                        store[key] = tb.astype(np.float32)
+                        total_new += 1
+                        print("    %s  Tb %.0f-%.0f K"
+                              % (key, tb.min(), tb.max()))
+                    except Exception as exc:                # noqa: BLE001
+                        total_fail += 1
+                        print("    %s  CROP FAILED  %s" % (key, str(exc)[:60]))
                 if not keep_granules and os.path.exists(local):
                     for _ in range(3):
                         try:
                             os.remove(local)
                             break
                         except OSError:
-                            time.sleep(0.5)   # antivirus may still hold it
+                            time.sleep(0.5)
+
+            # checkpoint after every batch: a day is ~45 min and an
+            # interrupted run should not lose it
+            if len(store) > before:
+                save_day(day, store)
 
         if len(store) > before:
             save_day(day, store)
@@ -160,6 +223,10 @@ def harvest(start_day, end_day, cfg, keep_granules=False, channel="TIR1"):
 
     print("\nharvest complete: %d new, %d already held, %d failed"
           % (total_new, total_have, total_fail))
+    if missed_days:
+        print("days with no granules (%d): %s"
+              % (len(missed_days), ", ".join(missed_days)))
+        print("re-run with --start/--end over those dates to fill the gaps")
     return 0
 
 
