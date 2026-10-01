@@ -3,3 +3,10 @@
 Thumbs.db
 node_modules/
 .vercel
+
+# data: granules are 8-90 MB each and re-downloadable from MOSDAC / GES DISC
+data/
+runs/
+*.h5
+*.HDF5
+*.npz
