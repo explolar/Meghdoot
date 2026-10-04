@@ -266,6 +266,71 @@ def bucket_to_scan(rows, scan_time, window_min=30):
     return out
 
 
+# --------------------------------------------------------------------------
+# API budget: the free tier allows 1000 calls per day, and there is one call
+# per station per poll. 54 stations at the 30-minute satellite cadence would
+# need 2592 calls, so something has to give.
+#
+# The choice is temporal resolution over station count, because a gauge
+# reading only verifies a scan if it can be bucketed against one. Polling
+# hourly would halve the usable comparisons for every station; polling fewer
+# stations loses coverage but keeps every reading matched to a scan.
+#
+# 20 stations x 48 polls = 960 calls/day, just inside the budget.
+DAILY_CALL_BUDGET = 1000
+POLLS_PER_DAY = 48                      # the 30-minute satellite cadence
+
+
+def max_station_count(budget=DAILY_CALL_BUDGET, polls=POLLS_PER_DAY,
+                      margin=40):
+    """How many stations fit the budget, leaving room for retries."""
+    return max(1, int((budget - margin) // polls))
+
+
+def spread_subset(stations, n, lat_c=LAT_C):
+    """Pick n stations that are spatially spread, not clustered.
+
+    Greedy max-min: start from the station nearest the box centre, then
+    repeatedly add whichever remaining station is furthest from everything
+    already chosen. The network is dense in central Kolkata and sparse
+    elsewhere - 256 of 903 station pairs sit within 10 km of each other - so
+    taking the first n in catalogue order would verify one neighbourhood
+    thoroughly and the rest of the domain not at all.
+    """
+    if len(stations) <= n:
+        return list(stations)
+
+    import math
+
+    def km(a, b):
+        dy = (a["latitude"] - b["latitude"]) * 111.0
+        dx = ((a["longitude"] - b["longitude"]) * 111.0
+              * math.cos(math.radians(lat_c)))
+        return math.hypot(dx, dy)
+
+    centre = {"latitude": LAT_C, "longitude": LON_C}
+    rest = list(stations)
+    chosen = [min(rest, key=lambda s: km(s, centre))]
+    rest.remove(chosen[0])
+
+    while len(chosen) < n and rest:
+        far = max(rest, key=lambda s: min(km(s, c) for c in chosen))
+        chosen.append(far)
+        rest.remove(far)
+    return chosen
+
+
+def verification_set(live_only=True, n=None):
+    """The stations to poll: spread, reporting, and inside the budget."""
+    sts = stations_in_box()
+    if live_only:
+        seen = {r["locality_id"] for r in load_archive()
+                if r.get("rain_mm") is not None}
+        if seen:
+            sts = [s for s in sts if s["locality_id"] in seen] or sts
+    return spread_subset(sts, n or max_station_count())
+
+
 if __name__ == "__main__":
     try:
         sts = stations_in_box()

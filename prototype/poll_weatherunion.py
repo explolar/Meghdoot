@@ -15,7 +15,7 @@ minutes so a scan never falls in a gap.
 Usage:
     python poll_weatherunion.py                  # poll until stopped
     python poll_weatherunion.py --once           # single snapshot
-    python poll_weatherunion.py --interval 900   # every 15 minutes
+    python poll_weatherunion.py --stations 20    # explicit station count
 """
 import argparse
 import datetime as dt
@@ -34,15 +34,30 @@ def main():
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--hours", type=float, default=0,
                     help="stop after this many hours; 0 means run forever")
+    ap.add_argument("--stations", type=int, default=None,
+                    help="how many stations to poll; default fits the budget")
+    ap.add_argument("--all-stations", action="store_true",
+                    help="poll every station in the box, ignoring the budget")
     args = ap.parse_args()
 
     try:
-        stations = wu.stations_in_box()
+        stations = (wu.stations_in_box() if args.all_stations
+                    else wu.verification_set(n=args.stations))
     except RuntimeError as e:
         print(e)
         return 1
-    print("polling %d stations in the Kolkata box every %d s"
-          % (len(stations), args.interval), flush=True)
+
+    # The free tier allows 1000 calls a day and each poll costs one call per
+    # station, so the two knobs trade against each other. Print the arithmetic
+    # rather than leaving it implicit: an over-budget poller fails silently
+    # partway through the day, which is the worst way to find out.
+    per_day = len(stations) * (86400.0 / args.interval)
+    print("polling %d stations every %d s -> %.0f calls/day (budget %d)"
+          % (len(stations), args.interval, per_day, wu.DAILY_CALL_BUDGET),
+          flush=True)
+    if per_day > wu.DAILY_CALL_BUDGET:
+        print("  WARNING: over budget. Reduce --stations or raise --interval.",
+              flush=True)
 
     deadline = (time.time() + args.hours * 3600) if args.hours else None
     polls = 0
