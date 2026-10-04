@@ -102,28 +102,53 @@ class UNetNowcast(nn.Module):
 
 
 # --------------------------------------------------------------------------
+# Weight schemes, in mm/h so they port between products.
+#
+# TrajGRU's published weights (1/2/5/10/30) were derived from Hong Kong radar.
+# Measured on this archive they are far too weak for the tail: the 10-30 band
+# holds 0.51% of pixels and the >30 band 0.03%, so pure inverse frequency would
+# ask for 185x and 3166x against the 1x baseline - the published scheme
+# under-weights the heaviest band by about 106x.
+#
+# The first run showed exactly the failure that predicts: CSI 0.000 at 20 mm/h
+# against persistence at 0.089. The model paid almost nothing for missing the
+# events the system exists to warn about.
+#
+# Pure inverse frequency is not the fix either - a 3166x weight lets a handful
+# of pixels dominate every gradient and training destabilises. These schemes
+# step between the two so the trade can be measured rather than guessed.
+WEIGHT_SCHEMES = {
+    "trajgru": (1.0, 2.0, 5.0, 10.0, 30.0),        # published, the baseline
+    "moderate": (1.0, 5.0, 20.0, 60.0, 150.0),     # ~5x the published tail
+    "strong": (1.0, 10.0, 40.0, 150.0, 500.0),     # ~17x
+    "sqrt_inv": (1.0, 4.7, 8.6, 13.6, 56.3),       # sqrt of inverse frequency
+    "inv_freq": (1.0, 22.4, 73.2, 185.3, 3166.3),  # pure inverse frequency
+}
+
+
 def balanced_weights(y, bins=(2.0, 5.0, 10.0, 30.0),
-                     weights=(1.0, 2.0, 5.0, 10.0, 30.0)):
+                     weights=None, scheme="trajgru"):
     """Per-pixel weights by rain rate, in mm/h so they port between products.
 
-    From the TrajGRU balanced loss: w = 1 below 2 mm/h, 2 in 2-5, 5 in 5-10,
-    10 in 10-30, 30 above 30. Heavy rain is rare, so without this the cheapest
-    way to cut squared error is to predict near-zero everywhere.
+    Bands are < 2, 2-5, 5-10, 10-30 and >= 30 mm/h. `scheme` picks a row from
+    WEIGHT_SCHEMES; `weights` overrides it directly.
     """
+    if weights is None:
+        weights = WEIGHT_SCHEMES[scheme]
     w = torch.full_like(y, weights[0])
     for edge, wt in zip(bins, weights[1:]):
         w = torch.where(y >= edge, torch.full_like(y, wt), w)
     return w
 
 
-def balanced_loss(pred, target, under_penalty=1.3):
+def balanced_loss(pred, target, under_penalty=1.3, scheme="trajgru"):
     """Weighted MSE + MAE, with an extra penalty for under-forecasting.
 
     The asymmetry matters for a warning system: predicting 5 mm/h when 20 fell
     is a missed warning, while predicting 20 when 5 fell is a false alarm. They
     are not equally costly, so they do not get equal gradient.
     """
-    w = balanced_weights(target)
+    w = balanced_weights(target, scheme=scheme)
     err = pred - target
     under = (err < 0).float() * (under_penalty - 1.0) + 1.0
     w = w * under

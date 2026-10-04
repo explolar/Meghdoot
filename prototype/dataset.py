@@ -24,17 +24,26 @@ ARCHIVE = r"E:\sih\data\archive"
 
 
 # --------------------------------------------------------------------------
-def load_archive(folder=ARCHIVE, verbose=True):
-    """Read every harvested day into {datetime: (tb, rain)} pairs.
+def load_archive(folder=ARCHIVE, verbose=True, source="hem"):
+    """Read every harvested day into {datetime: (input, label)} pairs.
 
-    Only timestamps present in *both* products are kept: an INSAT frame with no
-    IMERG label cannot be trained on, and a label with no image cannot be
+    `source` selects the live input channel:
+
+      "hem"    ISRO's operational Hydro-Estimator rain rate, which is what the
+               plan specifies and what the deployed system would read
+      "insat"  raw L1C brightness temperature, kept so the earlier runs remain
+               reproducible
+
+    Only timestamps present in *both* products are kept: an input frame with no
+    IMERG label cannot be trained on, and a label with no input cannot be
     predicted from.
     """
     insat, imerg = {}, {}
 
-    for p in sorted(glob.glob(os.path.join(folder, "insat_*.npz"))):
-        day = os.path.basename(p)[6:14]
+    prefix = "hem_" if source == "hem" else "insat_"
+    cut = len(prefix)
+    for p in sorted(glob.glob(os.path.join(folder, prefix + "*.npz"))):
+        day = os.path.basename(p)[cut:cut + 8]
         with np.load(p) as z:
             for k in z.files:
                 t = dt.datetime.strptime(day + k, "%Y%m%d%H%M")
@@ -92,7 +101,8 @@ def denormalise_rain(x):
 
 
 # --------------------------------------------------------------------------
-def build_windows(paired, n_in=3, leads=(1, 2, 3, 4, 5, 6), step_min=30):
+def build_windows(paired, n_in=3, leads=(1, 2, 3, 4, 5, 6), step_min=30,
+                  source="hem"):
     """Carve consecutive-in-time windows out of the paired archive.
 
     A window is only emitted when every frame it needs is present at exactly
@@ -114,7 +124,12 @@ def build_windows(paired, n_in=3, leads=(1, 2, 3, 4, 5, 6), step_min=30):
             continue
 
         frames = [normalise_rain(paired[n][1]) for n in needed]   # past rain
-        frames.append(normalise_tb(paired[t][0]))                 # IR channel
+        # the live channel: HEM is already a rain rate, so it takes the same
+        # log transform as the IMERG frames; L1C is a temperature and needs
+        # its own scaling
+        extra = paired[t][0]
+        frames.append(normalise_rain(extra) if source == "hem"
+                      else normalise_tb(extra))
         X.append(np.stack(frames))
         Y.append(np.stack([paired[g][1] for g in targets]))       # mm/h, raw
         stamps.append(t)
