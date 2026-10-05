@@ -50,9 +50,17 @@ class UNetNowcast(nn.Module):
     base    : channel width at full resolution; doubles at each downsample
     """
 
-    def __init__(self, in_ch=4, leads=6, base=32, dropout=0.5):
+    def __init__(self, in_ch=4, leads=6, base=32, dropout=0.5,
+                 last_idx=2, base_space="mm"):
         super().__init__()
         self.leads = leads
+        # which input channel is the newest frame, and which space the residual
+        # base is added in. Inputs are log1p-normalised but the output is
+        # scored in mm/h, so the base must be converted back with expm1 or the
+        # "persistence floor" is really log1p(rain): at 30 mm/h it starts at
+        # 3.4. base_space="log" reproduces that earlier behaviour for ablation.
+        self.last_idx = last_idx
+        self.base_space = base_space
 
         self.enc1 = ConvBlock(in_ch, base)            # 128 -> 128
         self.enc2 = ConvBlock(base, base * 2)         #  64
@@ -82,7 +90,9 @@ class UNetNowcast(nn.Module):
         Returns (B, leads, H, W) of rain rate in mm/h.
         """
         # the most recent rain frame, which the residual head adds back
-        last = x[:, 2:3]
+        last = x[:, self.last_idx:self.last_idx + 1]
+        if self.base_space == "mm":
+            last = torch.expm1(last)
 
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))

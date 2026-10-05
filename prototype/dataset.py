@@ -20,11 +20,15 @@ import os
 
 import numpy as np
 
+import coreg
+
 ARCHIVE = r"E:\sih\data\archive"
+HEM_FOLDER = ARCHIVE.replace("archive", "archive_v2")
 
 
 # --------------------------------------------------------------------------
-def load_archive(folder=ARCHIVE, verbose=True, source="hem"):
+def load_archive(folder=ARCHIVE, verbose=True, source="hem",
+                 hem_folder=HEM_FOLDER):
     """Read every harvested day into {datetime: (input, label)} pairs.
 
     `source` selects the live input channel:
@@ -40,14 +44,28 @@ def load_archive(folder=ARCHIVE, verbose=True, source="hem"):
     """
     insat, imerg = {}, {}
 
-    prefix = "hem_" if source == "hem" else "insat_"
+    # HEM lives in its own archive: the first one was cropped from the wrong
+    # part of the Earth and is not read. L1C stays in the original folder.
+    src_folder, prefix = ((hem_folder, "hem_") if source == "hem"
+                          else (folder, "insat_"))
     cut = len(prefix)
-    for p in sorted(glob.glob(os.path.join(folder, prefix + "*.npz"))):
-        day = os.path.basename(p)[cut:cut + 8]
+    for p in sorted(glob.glob(os.path.join(src_folder, prefix + "*.npz"))):
+        name = os.path.basename(p)
+        if name.startswith("hem_grid"):
+            continue                      # coordinates, not a day of frames
+        day = name[cut:cut + 8]
         with np.load(p) as z:
             for k in z.files:
                 t = dt.datetime.strptime(day + k, "%Y%m%d%H%M")
                 insat[t] = z[k]
+
+    lat2d = lon2d = None
+    if source == "hem":
+        with np.load(os.path.join(hem_folder, "hem_grid.npz")) as g:
+            lat2d, lon2d = g["lat"], g["lon"]
+        if not coreg.covered(lat2d, lon2d):
+            raise ValueError("HEM crop is not inside the IMERG crop; labels "
+                             "at the edge would be clipped, not observed")
 
     for p in sorted(glob.glob(os.path.join(folder, "imerg_*.npz"))):
         day = os.path.basename(p)[6:14]
@@ -62,7 +80,12 @@ def load_archive(folder=ARCHIVE, verbose=True, source="hem"):
         slot = t.replace(minute=0 if t.minute < 30 else 30,
                          second=0, microsecond=0)
         if slot in imerg:
-            paired[t] = (tb, imerg[slot])
+            label = imerg[slot]
+            if source == "hem":
+                # align by geography, not array position: the HEM grid is
+                # tilted, so each HEM pixel looks up its own IMERG cell
+                label = coreg.to_grid(label, lat2d, lon2d)
+            paired[t] = (tb, label)
 
     if verbose:
         print("archive: %d INSAT frames, %d IMERG frames, %d paired"
@@ -102,7 +125,7 @@ def denormalise_rain(x):
 
 # --------------------------------------------------------------------------
 def build_windows(paired, n_in=3, leads=(1, 2, 3, 4, 5, 6), step_min=30,
-                  source="hem"):
+                  source="hem", history="imerg"):
     """Carve consecutive-in-time windows out of the paired archive.
 
     A window is only emitted when every frame it needs is present at exactly
@@ -123,20 +146,28 @@ def build_windows(paired, n_in=3, leads=(1, 2, 3, 4, 5, 6), step_min=30,
         if not all(g in tset for g in targets):
             continue
 
-        frames = [normalise_rain(paired[n][1]) for n in needed]   # past rain
-        # the live channel: HEM is already a rain rate, so it takes the same
-        # log transform as the IMERG frames; L1C is a temperature and needs
-        # its own scaling
-        extra = paired[t][0]
-        frames.append(normalise_rain(extra) if source == "hem"
-                      else normalise_tb(extra))
+        if history == "hem":
+            # DEPLOYABLE layout: every input frame is the live product. HEM
+            # reaches us about an hour after its scan, so this is the only
+            # history a running system actually has. IMERG is the label only.
+            frames = [normalise_rain(paired[n][0]) for n in needed]
+        else:
+            # LEGACY layout: past rain frames come from IMERG, which Early
+            # delivers hours late. Fine for studying IMERG's own predictability,
+            # but a model trained this way cannot run live.
+            frames = [normalise_rain(paired[n][1]) for n in needed]
+            extra = paired[t][0]
+            frames.append(normalise_rain(extra) if source == "hem"
+                          else normalise_tb(extra))
         X.append(np.stack(frames))
         Y.append(np.stack([paired[g][1] for g in targets]))       # mm/h, raw
         stamps.append(t)
 
     if not X:
-        return (np.zeros((0, n_in + 1, 128, 128), np.float32),
-                np.zeros((0, len(leads), 128, 128), np.float32), [])
+        n_ch = n_in if history == "hem" else n_in + 1
+        hh, ww = (next(iter(paired.values()))[0].shape if paired else (96, 96))
+        return (np.zeros((0, n_ch, hh, ww), np.float32),
+                np.zeros((0, len(leads), hh, ww), np.float32), [])
     return (np.asarray(X, np.float32), np.asarray(Y, np.float32), stamps)
 
 

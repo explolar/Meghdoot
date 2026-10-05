@@ -165,9 +165,12 @@ class SmaAtUNet(nn.Module):
     verified against the published file.
     """
 
-    def __init__(self, n_channels=4, n_classes=6, residual=True):
+    def __init__(self, n_channels=4, n_classes=6, residual=True,
+                 last_idx=2, base_space="mm"):
         super().__init__()
         self.residual = residual
+        self.last_idx = last_idx
+        self.base_space = base_space
         self.inc = DoubleConvDS(n_channels, 64)
         self.cbam1 = CBAM(64)
         self.down1 = DownDS(64, 128)
@@ -185,7 +188,9 @@ class SmaAtUNet(nn.Module):
         self.outc = OutConv(64, n_classes)
 
     def forward(self, x):
-        last = x[:, 2:3]                        # newest rain frame
+        last = x[:, self.last_idx:self.last_idx + 1]      # newest rain frame
+        if self.base_space == "mm":
+            last = torch.expm1(last)            # inputs are log1p, output is mm/h
 
         x1 = self.inc(x)
         x1a = self.cbam1(x1)

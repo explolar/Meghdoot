@@ -40,7 +40,9 @@ import mosdac_io as M                                      # noqa: E402
 import hem                                                 # noqa: E402
 
 CONFIG = os.path.join(NIRA, "config.yaml")
-ARCHIVE = r"E:\sih\data\archive"
+# A fresh folder, deliberately. The earlier hem_*.npz files were cropped from the
+# wrong part of the Earth (see hem.py), so they must never be mixed in.
+ARCHIVE = r"E:\sih\data\archive_v2"
 SCRATCH = r"E:\sih\data\_scratch_hem"
 DATASET = "3RIMG_L2B_HEM"
 
@@ -60,6 +62,15 @@ def parse_stamp(identifier):
         return dt.datetime(int(y), MONTHS[mon], int(d), int(hh), int(mm))
     except (KeyError, ValueError):
         return None
+
+
+def save_grid(meta):
+    """Store the crop's per-pixel lat/lon once. The grid is fixed for the
+    product, and alignment needs it far more often than a granule is opened."""
+    path = os.path.join(ARCHIVE, "hem_grid.npz")
+    if not os.path.exists(path):
+        os.makedirs(ARCHIVE, exist_ok=True)
+        np.savez_compressed(path, lat=meta["lat"], lon=meta["lon"])
 
 
 def day_path(day):
@@ -211,6 +222,7 @@ def harvest(start_day, end_day, cfg, keep_granules=False):
                 else:
                     try:
                         rain, _meta = hem.read_box(local)
+                        save_grid(_meta)
                         store[key] = rain.astype(np.float32)
                         total_new += 1
                         if rain.max() > 1.0:

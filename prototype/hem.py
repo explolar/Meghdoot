@@ -1,100 +1,111 @@
 # -*- coding: utf-8 -*-
 """Read INSAT-3R L2B Hydro-Estimator granules.
 
-This replaces the L1C path for the live input channel, and it is better on
-both axes that matter.
+HEM is ISRO's operational Hydro-Estimator rain rate, the product the plan names
+as the live input. A granule is 9.6 MB against L1C's 85 MB and carries rain rate
+directly rather than raw radiance, so it is both smaller and closer to the
+product the benchmark is measured against.
 
-Scientifically: HEM *is* ISRO's operational Hydro-Estimator rain rate, which is
-the product the plan names. The L1C path downloaded six raw radiance channels
-and applied a published power-law fit to cloud-top temperature as a stand-in,
-which is a reasonable approximation but not the operational retrieval. HEM has
-the precipitable-water-dependent coefficients, the orographic correction and
-the warm-cloud correction built in, because ISRO computed it.
+GEOREFERENCING - read this before touching the crop.
 
-Practically: a HEM granule is 9.6 MB against L1C's 85 MB, an 8.9x reduction,
-and downloads in about five seconds rather than twenty. Two months of INSAT
-goes from roughly thirty hours to under four.
+The file offers three things that look like a georeference. Only one is right.
 
-The geolocation needs care. Latitude and Longitude are int16 with a 0.01 scale
-factor, which overflows for anything past 327.67 degrees, so the raw arrays
-show impossible values. The GeoX/GeoY coordinate vectors are the reliable
-georeference and are what this module uses.
+    GeoX / GeoY          plain index vectors 0..N-1. Not coordinates.
+    root attributes      upper/lower_latitude, left/right_longitude. These are
+                         the full-DISC bounds (about +-81 degrees), not the
+                         edges of the array. Interpolating linearly between
+                         them looks plausible and is wrong: it put Kolkata
+                         about 890 km south and 490 km west of where it is,
+                         so every earlier crop showed the wrong region.
+    Latitude/Longitude   per-pixel int16 grids in units of 0.01 degrees, with
+                         32767 marking off-disc pixels. These are the truth.
+
+So the study box is located by searching the 2-D grids for the pixel nearest the
+target, and the coordinate vectors are read back out of those same grids. The
+grid is regular at 0.04 degrees (about 4.4 km); that is checked, not assumed,
+because a rotated or curved grid would make the 1-D vectors below wrong.
+
+The grid is fixed for the product, so the pixel index is computed once per
+process and cached rather than re-reading ~32 MB of coordinates per granule.
 """
 import os
 
 import h5py
 import numpy as np
 
-# study box, matching insat.py and imerg.py
+# study box centre, matching imerg.py
 LAT_C, LON_C = 22.6, 88.4
-BOX = 128                      # 128 cells at 4 km = 512 km across
-
+BOX = 96                   # 96 cells x 0.04 deg = 3.84 deg ~ 420 km. A multiple
+                           # of 16 so the U-Net's four poolings divide evenly.
+                           # Small enough that, once the grid's tilt is allowed
+                           # for, every pixel still lies inside the IMERG crop.
 FILL = -999.0
+OFF_DISC = 32767           # Latitude/Longitude fill for pixels off the disc
+
+_CACHE = {}
 
 
-def _attr(h, name, default=None):
-    v = h.attrs.get(name, default)
-    if v is None:
-        return None
-    return float(v[0] if hasattr(v, "__len__") and not isinstance(v, bytes) else v)
-
-
-def _geo_vectors(h):
-    """Return (lat_vec, lon_vec) in degrees for the granule's grid.
-
-    Three things in this file look like a georeference and only one is:
-
-      GeoX / GeoY          plain 0..N-1 index vectors, not coordinates
-      Latitude / Longitude int16 grids where off-disc pixels are 32767, so
-                           naive scaling produces impossible values
-      root attributes      upper_latitude / lower_latitude and
-                           left_longitude / right_longitude
-
-    The attributes give the corner bounds of a regular grid, so the per-pixel
-    coordinates follow from linear interpolation across the array shape. That
-    is what this uses.
-    """
+def _locate(h, box, lat_c, lon_c):
+    """Row/column of the crop and its coordinate vectors, cached per grid."""
     ny, nx = h["HEM"].shape[1], h["HEM"].shape[2]
-    top = _attr(h, "upper_latitude")
-    bot = _attr(h, "lower_latitude")
-    left = _attr(h, "left_longitude")
-    right = _attr(h, "right_longitude")
-    if None in (top, bot, left, right):
-        raise ValueError("granule is missing its corner-coordinate attributes")
+    key = (ny, nx, box, round(lat_c, 3), round(lon_c, 3))
+    if key in _CACHE:
+        return _CACHE[key]
 
-    # row 0 is the northern edge, so latitude descends down the array
-    lat = np.linspace(top, bot, ny)
-    lon = np.linspace(left, right, nx)
-    return lat, lon
+    la = h["Latitude"][:].astype(np.float32)
+    lo = h["Longitude"][:].astype(np.float32)
+    ok = (la != OFF_DISC) & (lo != OFF_DISC)
+    la = np.where(ok, la * 0.01, np.nan)
+    lo = np.where(ok, lo * 0.01, np.nan)
+
+    dist = np.abs(la - lat_c) + np.abs(lo - lon_c)
+    r, c = np.unravel_index(np.nanargmin(dist), dist.shape)
+    half = box // 2
+    j0, i0 = r - half, c - half
+    j1, i1 = j0 + box, i0 + box
+    if j0 < 0 or i0 < 0 or j1 > ny or i1 > nx:
+        raise ValueError("study box falls off the edge of the grid")
+
+    lat2d = la[j0:j1, i0:i1].astype(np.float64)
+    lon2d = lo[j0:j1, i0:i1].astype(np.float64)
+    if not (np.isfinite(lat2d).all() and np.isfinite(lon2d).all()):
+        raise ValueError("study box includes off-disc pixels")
+
+    # The grid is NOT regular lat/lon. Over this box longitude drifts by ~0.7
+    # degrees from the top row to the bottom row, because meridians converge in
+    # the satellite's projection. A 1-D latitude vector plus a 1-D longitude
+    # vector would therefore be silently wrong, so the crop keeps a coordinate
+    # for every pixel and callers align other products pixel by pixel.
+    out = (j0, j1, i0, i1, lat2d, lon2d)
+    _CACHE[key] = out
+    return out
 
 
 def read_box(path, box=BOX, lat_c=LAT_C, lon_c=LON_C):
-    """Hydro-Estimator rain rate over the study box, in mm/h.
+    """Hydro-Estimator rain rate over the study box, in mm/h, north-up.
 
-    Returns (rain, meta). Fill values become zero: the product marks no-data
-    with -999, and for a rain field the honest reading of "no retrieval" over
-    this domain is "no rain detected", not "unknown".
+    Returns (rain, meta). meta["lat"] and meta["lon"] are (box, box) arrays
+    holding the true coordinates of every pixel, so a caller aligns another
+    product by coordinates rather than by array index. Row 0 is the northern
+    edge.
+
+    Fill values become zero: the product marks no-data with -999, and for a rain
+    field over this domain "no retrieval" is honestly "no rain detected".
     """
     with h5py.File(path, "r") as h:
-        lat_v, lon_v = _geo_vectors(h)
-        j = int(np.argmin(np.abs(lat_v - lat_c)))
-        i = int(np.argmin(np.abs(lon_v - lon_c)))
-        half = box // 2
-        j0 = max(j - half, 0)
-        i0 = max(i - half, 0)
-        j1, i1 = j0 + box, i0 + box
-
+        j0, j1, i0, i1, lat2d, lon2d = _locate(h, box, lat_c, lon_c)
         rain = h["HEM"][0, j0:j1, i0:i1].astype(np.float32)
         meta = {
             "file": os.path.basename(path),
             "date": h.attrs.get("Acquisition_Date"),
             "time_gmt": h.attrs.get("Acquisition_Time_in_GMT"),
-            "lat": lat_v[j0:j1],
-            "lon": lon_v[i0:i1],
-            "dlat_deg": float(abs(lat_v[1] - lat_v[0])),
-            "dlon_deg": float(abs(lon_v[1] - lon_v[0])),
+            "lat": lat2d,                     # (box, box), per pixel
+            "lon": lon2d,
+            "dlat_deg": float(abs(lat2d[box // 2 + 1, box // 2]
+                                  - lat2d[box // 2, box // 2])),
+            "dlon_deg": float(abs(lon2d[box // 2, box // 2 + 1]
+                                  - lon2d[box // 2, box // 2])),
         }
-
     rain = np.where(rain <= FILL + 1.0, 0.0, rain)
     rain = np.where(np.isfinite(rain), rain, 0.0)
     return np.clip(rain, 0.0, 200.0).astype(np.float32), meta
